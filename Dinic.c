@@ -1,0 +1,538 @@
+#include <stdio.h>
+#include <assert.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h> //for memset
+#include <limits.h> //for INT_MAX
+#define uv 0
+#define vu 1
+
+#define MAXN 10000
+#define MAXM 1000000
+#define MAXFLOW INT_MAX // max flow on one edge
+#define DEBUG 0
+
+// We assume that every edge also has its opposite edge. If not,
+// we add it with capacity 0.
+
+typedef struct edge
+{
+  int u, v; // endpoints
+  int c[2]; // capacities of uv and vu
+  int f[2]; // flows on uv and vu
+} edge_t;
+
+void sort_edges(edge_t *G, int n, int m)
+{
+	int *bucket = calloc(n + 1, sizeof(int));
+	edge_t *by2nd = malloc(m * sizeof(edge_t));
+	int i;
+	for (i = 0; i < m; i++)
+	{
+		bucket[G[i].v]++;
+	}
+	for (i = 1; i <= n; i++)
+	{
+		bucket[i] += bucket[i - 1];
+	}
+	for (i = 0; i < m; i++)
+	{
+		by2nd[--bucket[G[i].v]] = G[i];
+	}
+	memset(bucket, 0, (n + 1) * sizeof(int));
+	for (i = 0; i < m; i++)
+	{
+		bucket[G[i].u]++;
+	}
+	for (i = 1; i <= n; i++)
+	{
+		bucket[i] += bucket[i - 1];
+	}
+	for (i = m - 1; i >= 0; i--)
+	{
+		G[--bucket[by2nd[i].u]] = by2nd[i];
+	}
+	free(bucket);
+	free(by2nd);
+}
+
+// merges all edges between a pair of vertices into one.
+// assumes that all edges satisfy edge.u < edge.v
+// retval: updated number of edges after merge
+int merge_edges(edge_t *G, int n, int m)
+{
+	sort_edges(G, n, m);
+	if (DEBUG)
+	{
+		printf("before merge\n");
+		int i;
+		for (i = 0; i < m; i++)
+		{
+			printf("%d %d %d %d\n", G[i].u, G[i].v, G[i].c[uv], G[i].c[vu]);
+		}
+	}
+	int _m = 0;
+	
+	int i;
+	for (i = 1; i < m; i++)
+	{
+		if (G[i].u == G[_m].u && G[i].v == G[_m].v)
+		{
+		  G[_m].c[uv] += G[i].c[uv];
+		  G[_m].c[vu] += G[i].c[vu];
+		}
+		else
+		{
+		  G[++_m] = G[i];
+		}
+	}
+	m = (m == 0) ? m : _m + 1;
+	if (DEBUG)
+	{
+		printf("after merge\n");
+		for (i = 0; i < m; i++)
+		{
+			printf("%d %d %d %d\n", G[i].u, G[i].v, G[i].c[uv], G[i].c[vu]);
+		}
+	}
+	return m;
+}
+
+typedef struct dedge
+{          // directed edge in the reserve network
+	int v;   // target endpoint
+	int c;   // capacity
+	int f;   // flow
+	int idx; // index in the original edge list
+} dedge_t;
+
+typedef struct bedge
+{          // edge leading back in the cleaned reserve network
+	int u;   // target endpoint
+	int idx; // index in the dedge structre of the reserve network
+
+} bedge_t;
+
+typedef struct vertex
+{
+	int outdeg;          // real out degree
+	int d_idx, d_offset; // index and offset in the dedge structure of the reserve network
+	int b_idx, b_offset; // index and offset in the bedge structure of the reserve network
+	int lvl;             // level in the reserve network
+	bool alive;          // flag for vertices still in the reserve network
+} vertex_t;
+
+int n, m;      // # of vertices/edges
+int s, t;      // source and sink
+int l;         // distance of source and sink
+int reserve_m; // # of edges in the reserve network
+
+vertex_t V[MAXN];
+dedge_t E[2 * MAXM];
+bedge_t Eb[2 * MAXM];
+
+int path[MAXN]; // path in the cleaned reserve network
+
+// vertex queue for various purposes
+int Q[MAXN];
+int Qsize;
+
+static void reset_vertex_data()
+{
+	int i;
+	for (i = 0; i < n; i++)
+	{
+		V[i] = (vertex_t){0};
+		V[i].alive = true;
+		V[i].lvl = -1;
+	}
+}
+
+static void create_reserve_network(edge_t *G)
+{
+	reset_vertex_data();
+	reserve_m = 0;
+	int i;
+	for (i = 0; i < m; i++)
+	{
+		if (G[i].c[uv] - G[i].f[uv] + G[i].f[vu] > 0)
+		{
+			V[G[i].u].d_offset++;
+			reserve_m++;
+		}
+		if (G[i].c[vu] - G[i].f[vu] + G[i].f[uv] > 0)
+		{
+			V[G[i].v].d_offset++;
+			reserve_m++;
+		}
+	}
+	for (i = 1; i < n; i++)
+	{
+		V[i].d_idx = V[i - 1].d_idx + V[i - 1].d_offset;
+	}
+	for (i = 0; i < m; i++)
+	{
+		if (G[i].c[uv] - G[i].f[uv] + G[i].f[vu] > 0)
+		{
+			int idx = V[G[i].u].d_idx + V[G[i].u].outdeg++;
+			E[idx].v = G[i].v;
+			E[idx].c = G[i].c[uv] - G[i].f[uv] + G[i].f[vu];
+			E[idx].f = 0;
+			// save the position of the edge in original list for final flow augmentation
+			E[idx].idx = i;
+		}
+		if (G[i].c[vu] - G[i].f[vu] + G[i].f[uv] > 0)
+		{
+			int idx = V[G[i].v].d_idx + V[G[i].v].outdeg++;
+			E[idx].v = G[i].u;
+			E[idx].c = G[i].c[vu] - G[i].f[vu] + G[i].f[uv];
+			E[idx].f = 0;
+			// save the position of the edge in original list for final flow augmentation
+			E[idx].idx = i;
+		}
+	}
+}
+
+static void calculate_levels(void)
+{
+	Qsize = 0;
+	Q[Qsize++] = s;
+	V[s].lvl = 0;
+	int q;
+	for (q = 0; q < Qsize; q++)
+	{
+		assert(q < n);
+		
+		int u = Q[q];
+		int i;
+		for (i = V[u].d_idx; i < V[u].d_idx + V[u].d_offset; i++)
+		{
+			int v = E[i].v;
+			if (V[v].lvl == -1)
+			{
+				V[v].lvl = V[u].lvl + 1;
+				Q[Qsize++] = v;
+			}
+		}
+	}
+	l = V[t].lvl;
+	
+	if (DEBUG)
+	{
+		printf("lvls:\n");
+		int i;
+		for (i = 0; i < n; i++)
+		{
+			printf("%d ", V[i].lvl);
+		}
+		printf("\n");
+	}
+}
+
+static void clean_dead_ends()
+{
+	int q;
+	for (q = 0; q < Qsize; q++)
+	{
+		assert(q < n);
+		
+		int u = Q[q];
+		int i;
+		for (i = V[u].b_idx; i < V[u].b_idx + V[u].b_offset; i++)
+		{
+			if (E[Eb[i].idx].c > E[Eb[i].idx].f)
+			{ // if the edge is still there
+			    if (--V[Eb[i].u].outdeg == 0)
+			    {
+			    	V[Eb[i].u].alive = false;
+			    	Q[Qsize++] = Eb[i].u;
+			    }
+			}
+		}
+	}
+	Qsize = 0;
+}
+
+static bool clean_reserve_network()
+{
+	calculate_levels();
+	
+	// if there is no path from source to sink, finish
+	if (l == -1)
+	{
+		return false;
+	}
+	
+	Qsize = 0;
+	int i,j;
+	for (i = 0; i < n; i++)
+	{
+		// we will recalculate the out degree
+		V[i].outdeg = 0;
+		
+		// ignore vertices too far from the source
+		if (V[i].lvl >= l)
+		{
+			V[i].d_offset = 0;
+			if (i != t)
+			{
+				V[i].alive = false;
+			}
+		}
+		else
+		{
+			for (j = V[i].d_idx; j < V[i].d_idx + V[i].d_offset; j++)
+			{
+			// ignore edges that go to bad vertices or levels
+			if ((E[j].v == t || V[E[j].v].lvl < l) && V[E[j].v].lvl == V[i].lvl + 1)
+			{
+				E[V[i].d_idx + V[i].outdeg++] = E[j];
+			  // prepare back refs for dead end cleaning
+			  V[E[j].v].b_offset++;
+			}
+			}
+			
+			V[i].d_offset = V[i].outdeg; // at this point they are the same
+			
+			if (V[i].outdeg == 0)
+			{
+			V[i].alive = false;
+			Q[Qsize++] = i;
+			}
+		}
+	}
+	
+	assert(V[t].alive);
+	// construct back refs for dead end cleaning
+	for (i = 1; i < n; i++)
+	{
+	V[i].b_idx = V[i - 1].b_idx + V[i - 1].b_offset;
+	}
+	for (i = 0; i < n; i++)
+	{
+	V[i].b_offset = 0;
+	}
+	for (i = 0; i < n; i++)
+	{
+	for (j = V[i].d_idx; j < V[i].d_idx + V[i].d_offset; j++)
+	{
+	  // back ref for the edge i --> E[j].v
+	  int idx = V[E[j].v].b_idx + V[E[j].v].b_offset++;
+	  Eb[idx].u = i;
+	  Eb[idx].idx = j;
+	}
+	}
+	
+	// clean dead ends from the queue
+	clean_dead_ends();
+	
+	return true;
+}
+
+// returns maximal augmentation that can be done on the path
+static int find_path()
+{
+	int i,j;
+	if (DEBUG)
+	{
+		printf("PHASE OF LENGTH %d\n", l);
+		for (i = 0; i < n; i++)
+		{
+			printf("%d (%d, %d): ", i, V[i].d_offset, V[i].outdeg);
+			for (j = V[i].d_idx; j < V[i].d_idx + V[i].d_offset; j++)
+			{
+				if (V[E[j].v].alive)
+				{
+					printf("%d (%d), ", E[j].v, E[j].c - E[j].f);
+				}
+			}
+			printf("\n");
+		}
+	}
+	
+	int u = s;
+	int maxaug = MAXFLOW, aug, idx;
+	
+	for (i = 0; i < l; i++)
+	{
+	
+	// lazy elimination of dead vertices
+	while (V[u].d_offset > 0 && !V[E[V[u].d_idx + V[u].d_offset - 1].v].alive)
+	{
+		--V[u].d_offset;
+	}
+	idx = V[u].d_idx + V[u].d_offset - 1;
+	
+	// check for non-existent path
+	if (V[u].outdeg == 0)
+	{
+		return 0;
+	}
+	
+	// continue along the last edge in the neighbour list
+	path[i] = E[idx].v;
+	u = path[i];
+	
+	// update minimal augmentation of an edge on the path
+	aug = E[idx].c - E[idx].f;
+	maxaug = (aug < maxaug) ? aug : maxaug;
+	}
+	
+	assert(path[l - 1] == t);
+	
+	return maxaug;
+}
+
+static void augment_blocking_flow(int aug)
+{
+	int i;
+	int u = s, idx;
+	for (i = 0; i < l; i++)
+	{
+		idx = V[u].d_idx + V[u].d_offset - 1;
+		E[idx].f += aug; // increase flow along the edge
+		if (E[idx].f == E[idx].c)
+		{ // check if the capacity limit is reached
+			--V[u].d_offset;
+			if (--V[u].outdeg == 0)
+			{                     // this is the last edge
+				V[u].alive = false; // if the vertex has no more active outgoing edges, kill it
+				Q[Qsize++] = u;
+			}
+		}
+		u = path[i];
+	}
+}
+
+static void find_blocking_flow()
+{
+  int aug;
+  while ((aug = find_path()))
+  {
+    augment_blocking_flow(aug);
+    clean_dead_ends();
+  }
+}
+
+static void augment_flow(edge_t *G)
+{
+	int offset;
+	int i, u;
+	for (u = 0; u < n; u++)
+	{
+	    offset = (u < n - 1) ? V[u + 1].d_idx : reserve_m;
+	    for (i = V[u].d_idx; i < offset; i++)
+	    {
+			if (E[i].f > 0)
+			{
+			int idx = E[i].idx;
+			if (G[idx].u == u)
+			{
+				G[idx].f[uv] += E[i].f;
+				if (G[idx].f[uv] > G[idx].c[uv])
+				{
+					G[idx].f[vu] -= G[idx].f[uv] - G[idx].c[uv];
+					G[idx].f[uv] = G[idx].c[uv];
+				}
+			}
+			else
+				{
+				  G[idx].f[vu] += E[i].f;
+				  if (G[idx].f[vu] > G[idx].c[vu])
+				  {
+				    G[idx].f[uv] -= G[idx].f[vu] - G[idx].c[vu];
+				    G[idx].f[vu] = G[idx].c[vu];
+				  }
+				}
+			}
+	    }
+	}
+}
+
+int main(void)
+{
+/*
+6 9 0 5
+
+0 1 8
+0 2 12
+1 3 6
+1 4 10
+2 1 2
+2 3 10
+3 5 8
+4 3 2
+4 5 10
+*/
+	scanf("%d%d%d%d", &n, &m, &s, &t);
+	edge_t *G = malloc(m * sizeof(edge_t));
+	int i;
+	for (i = 0; i < m; i++)
+	{
+		int u, v, c;
+		scanf("%d%d%d", &u, &v, &c);
+		if (u == v)
+		{ // don't want any loops
+			continue;
+		}
+		G[i].f[uv] = G[i].f[vu] = 0;
+		if (u < v)
+		{
+			G[i].u = u;
+			G[i].v = v;
+			G[i].c[uv] = c;
+			G[i].c[vu] = 0;
+		}
+		else
+		{
+			G[i].u = v;
+			G[i].v = u;
+			G[i].c[uv] = 0;
+			G[i].c[vu] = c;
+		}
+	}
+	
+	m = merge_edges(G, n, m);
+	int phase;
+	for (phase = 0; phase < n; phase++)
+	{
+		create_reserve_network(G);
+		if (!clean_reserve_network())
+		{
+			break;
+		}
+		find_blocking_flow();
+		augment_flow(G);
+	}
+	
+	assert(!clean_reserve_network());
+	
+	long long max_flow = 0;
+	for (i = 0; i < m; i++)
+	{
+		if (G[i].u == s)
+		{
+			max_flow += (long long)G[i].f[uv];
+		}
+		if (G[i].v == s)
+		{
+			max_flow += (long long)G[i].f[vu];
+		}
+	}
+	printf("The maximum possible flow is %lld\n", max_flow);
+	
+	for (i = 0; i < m; i++)
+	{
+		if (G[i].f[uv] > 0)
+		{
+			printf("%d %d %d\n", G[i].u, G[i].v, G[i].f[uv]);
+		}
+		if (G[i].f[vu] > 0)
+		{
+			printf("%d %d %d\n", G[i].v, G[i].u, G[i].f[vu]);
+		}
+	}
+	
+	free(G);
+	return 0;
+}
